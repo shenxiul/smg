@@ -5,8 +5,8 @@ use openai_protocol::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
     responses::{
         CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest, ServiceTier,
-        Truncation, WebSearchPreviewTool,
+        ResponseInput, ResponseInputOutputItem, ResponseReasoningParam, ResponseTool,
+        ResponsesRequest, ServiceTier, Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
@@ -345,6 +345,186 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
 }
 
 #[tokio::test]
+async fn test_non_streaming_mcp_approval_continues_with_previous_response_id() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+
+    let ctx =
+        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
+            .await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req1 = ResponsesRequest {
+        background: Some(false),
+        include: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_approval_interrupt_prev_1".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let resp1 = router
+        .route_responses(None, &req1, req1.model.as_str())
+        .await;
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let body1_bytes = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body1_json: serde_json::Value =
+        serde_json::from_slice(&body1_bytes).expect("Failed to parse response JSON");
+
+    let approval_item = body1_json["output"]
+        .as_array()
+        .expect("response output missing")
+        .iter()
+        .find(|entry| entry.get("type").and_then(|v| v.as_str()) == Some("mcp_approval_request"))
+        .expect("missing mcp_approval_request output item");
+    let approval_request_id = approval_item["id"]
+        .as_str()
+        .expect("approval request should have id")
+        .to_string();
+    let first_response_id = body1_json["id"]
+        .as_str()
+        .expect("first response should have id")
+        .to_string();
+
+    let req2 = ResponsesRequest {
+        input: ResponseInput::Items(vec![ResponseInputOutputItem::McpApprovalResponse {
+            id: None,
+            approval_request_id: approval_request_id.clone(),
+            approve: true,
+            reason: None,
+        }]),
+        previous_response_id: Some(first_response_id),
+        request_id: Some("resp_test_mcp_approval_interrupt_prev_2".to_string()),
+        ..req1.clone()
+    };
+
+    let resp2 = router
+        .route_responses(None, &req2, req2.model.as_str())
+        .await;
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let body2_bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body2_json: serde_json::Value =
+        serde_json::from_slice(&body2_bytes).expect("Failed to parse response JSON");
+
+    assert_eq!(body2_json["status"], "completed");
+
+    let output = body2_json["output"]
+        .as_array()
+        .expect("response output missing");
+    assert!(
+        output
+            .iter()
+            .all(|entry| entry.get("type").and_then(|v| v.as_str()) != Some("mcp_approval_request")),
+        "resumed response should not emit another approval request"
+    );
+    assert!(
+        output
+            .iter()
+            .all(|entry| entry.get("type").and_then(|v| v.as_str()) != Some("mcp_list_tools")),
+        "previous_response_id resume should not repeat mcp_list_tools"
+    );
+
+    let mcp_call = output
+        .iter()
+        .find(|entry| entry.get("type").and_then(|v| v.as_str()) == Some("mcp_call"))
+        .expect("missing resumed mcp_call output item");
+    assert_eq!(
+        mcp_call.get("approval_request_id").and_then(|v| v.as_str()),
+        Some(approval_request_id.as_str())
+    );
+    assert_eq!(
+        mcp_call.get("server_label").and_then(|v| v.as_str()),
+        Some("mock")
+    );
+    assert_eq!(
+        mcp_call.get("name").and_then(|v| v.as_str()),
+        Some("brave_web_search")
+    );
+    assert!(mcp_call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| id.starts_with("mcp_")));
+    assert!(
+        output
+            .iter()
+            .any(|entry| entry.get("type").and_then(|v| v.as_str()) == Some("message")),
+        "resumed response should include the final assistant message"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
 async fn test_final_response_hides_internal_mcp_trace_items() {
     let mut mcp = MockMCPServer::start().await.expect("start mcp");
 
@@ -614,18 +794,24 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
     let output = body2_json["output"]
         .as_array()
         .expect("response output missing");
-    assert_eq!(
-        output.len(),
-        2,
-        "resume turn should return only current-turn MCP activity plus the final message: {body2_json}",
-    );
-    assert_eq!(output[0]["type"], "mcp_call");
-    assert_eq!(output[1]["type"], "message");
+    assert_eq!(body2_json["status"], "completed");
     assert!(
         output
             .iter()
             .all(|item| item.get("type").and_then(|v| v.as_str()) != Some("mcp_list_tools")),
         "existing bindings should not repeat mcp_list_tools on previous_response_id turns"
+    );
+    assert!(
+        output
+            .iter()
+            .all(|item| item.get("type").and_then(|v| v.as_str()) != Some("mcp_approval_request")),
+        "existing bindings should not emit a fresh mcp_approval_request on previous_response_id turns"
+    );
+    assert!(
+        output
+            .iter()
+            .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("message")),
+        "resume turn should include a final assistant message: {body2_json}"
     );
 
     worker.stop().await;

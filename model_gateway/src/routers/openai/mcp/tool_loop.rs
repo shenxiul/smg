@@ -17,7 +17,10 @@ use openai_protocol::{
         is_function_call_type, CodeInterpreterCallEvent, FileSearchCallEvent, ItemType, McpEvent,
         OutputItemEvent, WebSearchCallEvent,
     },
-    responses::{generate_id, ResponseInput, ResponseTool, ResponsesRequest},
+    responses::{
+        generate_id, normalize_input_item, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponseTool, ResponsesRequest,
+    },
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{
@@ -362,6 +365,209 @@ pub(crate) fn build_resume_payload(
     obj.insert("store".to_string(), Value::Bool(false));
 
     Ok(payload)
+}
+
+#[derive(Debug)]
+struct ApprovedToolContinuation {
+    approval_request_id: String,
+    call_id: String,
+    tool_name: String,
+    arguments: String,
+}
+
+struct ApprovedToolResumeContext<'a> {
+    base_payload: &'a Value,
+    tools_json: &'a Value,
+    prior_mcp_approval_requests: &'a [ResponseInputOutputItem],
+    current_input: &'a ResponseInput,
+    session: &'a McpToolSession<'a>,
+    model_id: &'a str,
+}
+
+fn raw_input_items(input: &ResponseInput) -> Vec<ResponseInputOutputItem> {
+    match input {
+        ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
+            id: generate_id("msg"),
+            role: "user".to_string(),
+            content: vec![ResponseContentPart::InputText { text: text.clone() }],
+            status: Some("completed".to_string()),
+        }],
+        ResponseInput::Items(items) => items.iter().map(normalize_input_item).collect(),
+    }
+}
+
+fn continuation_call_id_source(approval_request_id: &str) -> String {
+    if let Some(stripped) = approval_request_id.strip_prefix("mcpr_") {
+        format!("call_{stripped}")
+    } else {
+        normalize_tool_item_id_with_prefix(approval_request_id, "call_")
+    }
+}
+
+fn extract_approved_tool_continuation(
+    prior_mcp_approval_requests: &[ResponseInputOutputItem],
+    current_input: &ResponseInput,
+) -> Option<ApprovedToolContinuation> {
+    let mut input_items = prior_mcp_approval_requests.to_vec();
+    input_items.extend(raw_input_items(current_input));
+
+    let approval_request_id = input_items.iter().rev().find_map(|item| match item {
+        ResponseInputOutputItem::McpApprovalResponse {
+            approval_request_id,
+            approve,
+            ..
+        } if *approve => Some(approval_request_id.clone()),
+        _ => None,
+    })?;
+
+    let (tool_name, arguments) = input_items.iter().rev().find_map(|item| match item {
+        ResponseInputOutputItem::McpApprovalRequest {
+            id,
+            name,
+            arguments,
+            ..
+        } if *id == approval_request_id => Some((name.clone(), arguments.clone())),
+        _ => None,
+    })?;
+
+    Some(ApprovedToolContinuation {
+        approval_request_id: approval_request_id.clone(),
+        call_id: continuation_call_id_source(&approval_request_id),
+        tool_name,
+        arguments,
+    })
+}
+
+fn attach_approval_request_id(item: &mut Value, approval_request_id: &str) {
+    let Some(obj) = item.as_object_mut() else {
+        return;
+    };
+
+    if obj.get("type").and_then(|value| value.as_str()) == Some(ItemType::MCP_CALL) {
+        obj.insert(
+            "approval_request_id".to_string(),
+            Value::String(approval_request_id.to_string()),
+        );
+    }
+}
+
+async fn maybe_resume_approved_tool_call(
+    state: &mut ToolLoopState,
+    current_payload: &mut Value,
+    resume_ctx: ApprovedToolResumeContext<'_>,
+) -> Result<(), String> {
+    let Some(continuation) = extract_approved_tool_continuation(
+        resume_ctx.prior_mcp_approval_requests,
+        resume_ctx.current_input,
+    ) else {
+        return Ok(());
+    };
+
+    if !resume_ctx.session.has_exposed_tool(&continuation.tool_name) {
+        return Ok(());
+    }
+
+    let arguments: Value = match serde_json::from_str(&continuation.arguments) {
+        Ok(arguments) => arguments,
+        Err(e) => {
+            let error_output = format!("Invalid tool arguments: {e}");
+            let error_json = json!({ "error": &error_output });
+            let mut transformed_item = build_transformed_mcp_call_item(
+                &error_json,
+                &resume_ctx
+                    .session
+                    .tool_response_format(&continuation.tool_name),
+                &continuation.call_id,
+                &resume_ctx
+                    .session
+                    .resolve_tool_server_label(&continuation.tool_name),
+                &continuation.tool_name,
+                &continuation.arguments,
+            );
+            attach_approval_request_id(&mut transformed_item, &continuation.approval_request_id);
+
+            Metrics::record_mcp_tool_call(
+                resume_ctx.model_id,
+                &continuation.tool_name,
+                metrics_labels::RESULT_ERROR,
+            );
+
+            state.total_calls += 1;
+            state.record_call(
+                resume_ctx.session.is_builtin_tool(&continuation.tool_name),
+                continuation.call_id,
+                continuation.tool_name,
+                continuation.arguments,
+                error_output,
+                transformed_item,
+            );
+
+            *current_payload = build_resume_payload(
+                resume_ctx.base_payload,
+                &state.conversation_history,
+                &state.original_input,
+                resume_ctx.tools_json,
+                false,
+            )?;
+
+            return Ok(());
+        }
+    };
+
+    let tool_output = resume_ctx
+        .session
+        .execute_approved_tool(ToolExecutionInput {
+            call_id: continuation.call_id.clone(),
+            tool_name: continuation.tool_name.clone(),
+            arguments,
+        })
+        .await;
+
+    Metrics::record_mcp_tool_duration(
+        resume_ctx.model_id,
+        &tool_output.tool_name,
+        tool_output.duration,
+    );
+    Metrics::record_mcp_tool_call(
+        resume_ctx.model_id,
+        &tool_output.tool_name,
+        if tool_output.is_error {
+            metrics_labels::RESULT_ERROR
+        } else {
+            metrics_labels::RESULT_SUCCESS
+        },
+    );
+
+    let output_str = tool_output.output.to_string();
+    let mut transformed_item = build_transformed_mcp_call_item(
+        &tool_output.output,
+        &tool_output.response_format,
+        &continuation.call_id,
+        &tool_output.server_label,
+        &continuation.tool_name,
+        &continuation.arguments,
+    );
+    attach_approval_request_id(&mut transformed_item, &continuation.approval_request_id);
+
+    state.total_calls += 1;
+    state.record_call(
+        resume_ctx.session.is_builtin_tool(&continuation.tool_name),
+        continuation.call_id,
+        continuation.tool_name,
+        continuation.arguments,
+        output_str,
+        transformed_item,
+    );
+
+    *current_payload = build_resume_payload(
+        resume_ctx.base_payload,
+        &state.conversation_history,
+        &state.original_input,
+        resume_ctx.tools_json,
+        false,
+    )?;
+
+    Ok(())
 }
 
 /// Send mcp_list_tools events to client at the start of streaming
@@ -742,7 +948,9 @@ fn approval_prefix_items(
 
 pub(crate) struct ToolLoopExecutionContext<'a> {
     pub original_body: &'a ResponsesRequest,
+    pub sanitized_input: &'a ResponseInput,
     pub existing_mcp_list_tools_labels: &'a [String],
+    pub prior_mcp_approval_requests: &'a [ResponseInputOutputItem],
     pub session: &'a McpToolSession<'a>,
 }
 
@@ -757,12 +965,14 @@ pub(crate) async fn execute_tool_loop(
 ) -> Result<Value, String> {
     let ToolLoopExecutionContext {
         original_body,
+        sanitized_input,
         existing_mcp_list_tools_labels,
+        prior_mcp_approval_requests,
         session,
     } = tool_loop_ctx;
 
     let mut state = ToolLoopState::new(
-        original_body.input.clone(),
+        sanitized_input.clone(),
         existing_mcp_list_tools_labels.to_vec(),
     );
     let max_tool_calls = original_body.max_tool_calls.map(|n| n as usize);
@@ -776,6 +986,20 @@ pub(crate) async fn execute_tool_loop(
     );
     let provider = ApiProvider::from_url(url);
     let auth_header = provider.extract_auth_header(headers, worker_api_key);
+
+    maybe_resume_approved_tool_call(
+        &mut state,
+        &mut current_payload,
+        ApprovedToolResumeContext {
+            base_payload: &base_payload,
+            tools_json: &tools_json,
+            prior_mcp_approval_requests,
+            current_input: &original_body.input,
+            session,
+            model_id: &original_body.model,
+        },
+    )
+    .await?;
 
     loop {
         let request_builder = client.post(url).json(&current_payload);

@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
-use openai_protocol::{chat::ChatCompletionRequest, responses::ResponsesRequest};
+use openai_protocol::{
+    chat::ChatCompletionRequest,
+    responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+};
 use serde_json::Value;
 use smg_data_connector::{
     ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
@@ -105,10 +108,22 @@ pub struct PayloadState {
     pub url: String,
 }
 
-#[derive(Default)]
 pub struct ResponsesPayloadState {
     pub previous_response_id: Option<String>,
     pub existing_mcp_list_tools_labels: Vec<String>,
+    pub prior_mcp_approval_requests: Vec<ResponseInputOutputItem>,
+    pub sanitized_input: ResponseInput,
+}
+
+impl Default for ResponsesPayloadState {
+    fn default() -> Self {
+        Self {
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            prior_mcp_approval_requests: Vec::new(),
+            sanitized_input: ResponseInput::Text(String::new()),
+        }
+    }
 }
 
 impl RequestContext {

@@ -40,6 +40,8 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
     let ResponsesPayloadState {
         previous_response_id,
         existing_mcp_list_tools_labels,
+        prior_mcp_approval_requests,
+        sanitized_input,
     } = ctx.take_responses_payload().unwrap_or_default();
 
     let original_body = match ctx.responses_request() {
@@ -89,7 +91,9 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             payload,
             ToolLoopExecutionContext {
                 original_body,
+                sanitized_input: &sanitized_input,
                 existing_mcp_list_tools_labels: &existing_mcp_list_tools_labels,
+                prior_mcp_approval_requests: &prior_mcp_approval_requests,
                 session: &session,
             },
         )

@@ -125,6 +125,7 @@ pub(in crate::routers::openai) async fn route_responses(
     if let ResponseInput::Items(ref mut items) = request_body.input {
         items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
     }
+    request_body.input = super::history::sanitize_input_for_upstream(&request_body.input);
 
     let mut payload = match to_value(&request_body) {
         Ok(v) => v,
@@ -143,6 +144,7 @@ pub(in crate::routers::openai) async fn route_responses(
             );
         }
     };
+    let sanitized_input = request_body.input;
 
     let provider = resolve_provider(deps.provider_registry, worker.as_ref(), model);
     if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
@@ -177,6 +179,8 @@ pub(in crate::routers::openai) async fn route_responses(
     ctx.state.responses_payload = Some(ResponsesPayloadState {
         previous_response_id: loaded_history.previous_response_id,
         existing_mcp_list_tools_labels: loaded_history.existing_mcp_list_tools_labels,
+        prior_mcp_approval_requests: loaded_history.prior_mcp_approval_requests,
+        sanitized_input,
     });
 
     let response = if ctx.is_streaming() {

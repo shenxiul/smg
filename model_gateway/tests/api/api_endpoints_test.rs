@@ -1194,6 +1194,45 @@ mod responses_endpoint_tests {
 
         ctx.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn test_v1_responses_validation_allows_approval_response_without_message() {
+        let ctx = create_openai_ctx(18974).await;
+        let app = ctx.create_app();
+
+        let (status, body) = create_response(
+            &app,
+            json!({
+                "input": "Hello",
+                "model": "mock-model",
+                "stream": false,
+                "store": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resp_id = body["id"].as_str().expect("response should have id");
+
+        let (status, body) = create_response(
+            &app,
+            json!({
+                "input": [{
+                    "type": "mcp_approval_response",
+                    "approval_request_id": "mcpr_test_123",
+                    "approve": true
+                }],
+                "model": "mock-model",
+                "stream": false,
+                "previous_response_id": resp_id
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]

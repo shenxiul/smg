@@ -8,7 +8,10 @@ use std::collections::HashSet;
 use axum::response::Response;
 use openai_protocol::{
     event_types::ItemType,
-    responses::{ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+    responses::{
+        generate_id, normalize_input_item, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponsesRequest,
+    },
 };
 use serde_json::Value;
 use smg_data_connector::{ConversationId, ListParams, ResponseId, ResponseStorageError, SortOrder};
@@ -25,6 +28,27 @@ const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 pub(crate) struct LoadedInputHistory {
     pub previous_response_id: Option<String>,
     pub existing_mcp_list_tools_labels: Vec<String>,
+    pub prior_mcp_approval_requests: Vec<ResponseInputOutputItem>,
+}
+
+pub(crate) fn sanitize_input_for_upstream(input: &ResponseInput) -> ResponseInput {
+    match input {
+        ResponseInput::Text(text) => ResponseInput::Text(text.clone()),
+        ResponseInput::Items(items) => ResponseInput::Items(
+            items
+                .iter()
+                .filter_map(|item| {
+                    let normalized = normalize_input_item(item);
+                    (!matches!(
+                        normalized,
+                        ResponseInputOutputItem::McpApprovalRequest { .. }
+                            | ResponseInputOutputItem::McpApprovalResponse { .. }
+                    ))
+                    .then_some(normalized)
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// Load conversation history and/or previous response chain into request input.
@@ -42,6 +66,7 @@ pub(crate) async fn load_input_history(
         .take()
         .filter(|id| !id.is_empty());
     let mut existing_mcp_list_tools_labels = HashSet::new();
+    let mut prior_mcp_approval_requests = Vec::new();
 
     // Load items from previous response chain if specified
     let mut chain_items: Option<Vec<ResponseInputOutputItem>> = None;
@@ -59,13 +84,26 @@ pub(crate) async fn load_input_history(
                     )
                 }));
 
+                prior_mcp_approval_requests = chain
+                    .responses
+                    .iter()
+                    .flat_map(|stored| {
+                        extract_mcp_approval_requests_from_array(
+                            stored
+                                .raw_response
+                                .get("output")
+                                .unwrap_or(&Value::Array(vec![])),
+                        )
+                    })
+                    .collect();
+
                 let items: Vec<ResponseInputOutputItem> = chain
                     .responses
                     .iter()
                     .flat_map(|stored| {
-                        deserialize_items_from_array(&stored.input)
+                        deserialize_upstream_input_items(&stored.input)
                             .into_iter()
-                            .chain(deserialize_items_from_array(
+                            .chain(deserialize_upstream_output_items_from_array(
                                 stored
                                     .raw_response
                                     .get("output")
@@ -223,23 +261,158 @@ pub(crate) async fn load_input_history(
     Ok(LoadedInputHistory {
         previous_response_id,
         existing_mcp_list_tools_labels: existing_mcp_list_tools_labels.into_iter().collect(),
+        prior_mcp_approval_requests,
     })
 }
 
-/// Deserialize ResponseInputOutputItems from a JSON array value
-fn deserialize_items_from_array(array: &Value) -> Vec<ResponseInputOutputItem> {
+fn extract_mcp_approval_requests_from_array(array: &Value) -> Vec<ResponseInputOutputItem> {
     array
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|item| {
-                    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
-                        .map_err(|e| warn!("Failed to deserialize item: {}. Item: {}", e, item))
-                        .ok()
+                    (item.get("type").and_then(|value| value.as_str())
+                        == Some("mcp_approval_request"))
+                    .then(|| serde_json::from_value::<ResponseInputOutputItem>(item.clone()))
+                    .transpose()
+                    .map_err(|e| {
+                        warn!(
+                            "Failed to deserialize mcp_approval_request for replay: {}",
+                            e
+                        );
+                    })
+                    .ok()
+                    .flatten()
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn deserialize_upstream_input_items(input: &Value) -> Vec<ResponseInputOutputItem> {
+    match input {
+        Value::String(text) => vec![ResponseInputOutputItem::Message {
+            id: generate_id("msg"),
+            role: "user".to_string(),
+            content: vec![ResponseContentPart::InputText { text: text.clone() }],
+            status: Some("completed".to_string()),
+        }],
+        Value::Array(arr) => arr
+            .iter()
+            .flat_map(upstream_input_items_from_value)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn deserialize_upstream_output_items_from_array(array: &Value) -> Vec<ResponseInputOutputItem> {
+    array
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .flat_map(upstream_output_items_from_value)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn upstream_input_items_from_value(item: &Value) -> Vec<ResponseInputOutputItem> {
+    let Ok(parsed) = serde_json::from_value::<ResponseInputOutputItem>(item.clone()) else {
+        warn!(
+            "Failed to deserialize input item for upstream replay: {}",
+            item
+        );
+        return Vec::new();
+    };
+
+    match normalize_input_item(&parsed) {
+        ResponseInputOutputItem::McpApprovalRequest { .. }
+        | ResponseInputOutputItem::McpApprovalResponse { .. } => Vec::new(),
+        item => vec![item],
+    }
+}
+
+fn upstream_output_items_from_value(item: &Value) -> Vec<ResponseInputOutputItem> {
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some(ItemType::MCP_LIST_TOOLS) | Some("mcp_approval_request") => Vec::new(),
+        Some(ItemType::MCP_CALL) => mcp_call_output_to_upstream_items(item),
+        _ => upstream_input_items_from_value(item),
+    }
+}
+
+fn mcp_call_output_to_upstream_items(item: &Value) -> Vec<ResponseInputOutputItem> {
+    let Some(id) = item.get("id").and_then(|value| value.as_str()) else {
+        warn!(
+            "Skipping mcp_call without id during upstream replay: {}",
+            item
+        );
+        return Vec::new();
+    };
+    let Some(name) = item.get("name").and_then(|value| value.as_str()) else {
+        warn!(
+            "Skipping mcp_call without name during upstream replay: {}",
+            item
+        );
+        return Vec::new();
+    };
+    let Some(arguments) = item.get("arguments").and_then(|value| value.as_str()) else {
+        warn!(
+            "Skipping mcp_call without arguments during upstream replay: {}",
+            item
+        );
+        return Vec::new();
+    };
+
+    let output = item
+        .get("output")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            item.get("output")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string())
+        });
+
+    let call_id = item
+        .get("approval_request_id")
+        .and_then(|value| value.as_str())
+        .map(approval_request_to_call_id)
+        .unwrap_or_else(|| mcp_item_id_to_prefixed_id(id, "call_"));
+
+    vec![
+        ResponseInputOutputItem::FunctionToolCall {
+            id: mcp_item_id_to_prefixed_id(id, "fc_"),
+            call_id: call_id.clone(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            output: None,
+            status: Some("completed".to_string()),
+        },
+        ResponseInputOutputItem::FunctionCallOutput {
+            id: None,
+            call_id,
+            output,
+            status: Some("completed".to_string()),
+        },
+    ]
+}
+
+fn approval_request_to_call_id(approval_request_id: &str) -> String {
+    if let Some(stripped) = approval_request_id.strip_prefix("mcpr_") {
+        format!("call_{stripped}")
+    } else {
+        mcp_item_id_to_prefixed_id(approval_request_id, "call_")
+    }
+}
+
+fn mcp_item_id_to_prefixed_id(item_id: &str, prefix: &str) -> String {
+    if let Some(stripped) = item_id.strip_prefix("mcp_") {
+        format!("{prefix}{stripped}")
+    } else if let Some(stripped) = item_id.strip_prefix("mcpr_") {
+        format!("{prefix}{stripped}")
+    } else {
+        format!("{prefix}{item_id}")
+    }
 }
 
 fn extract_mcp_list_tools_labels(array: &Value) -> Vec<String> {
@@ -274,9 +447,7 @@ fn append_current_input(
             });
         }
         ResponseInput::Items(current_items) => {
-            for item in current_items {
-                items.push(openai_protocol::responses::normalize_input_item(item));
-            }
+            items.extend(current_items.iter().map(normalize_input_item));
         }
     }
 }
